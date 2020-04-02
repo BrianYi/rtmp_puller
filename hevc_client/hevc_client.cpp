@@ -33,11 +33,7 @@ extern "C" {
 #define STREAM_CHANNEL_VIDEO     0x04
 #define STREAM_CHANNEL_AUDIO     0x05
 
-#define KB(bytes) (bytes/1024.0)
-#define MB(bytes) (KB(bytes)/1024.0)
-#define GB(bytes) (MB(bytes)/1024.0)
-
-#define BUFSIZE 10 * 1024
+//#define BUFSIZE 10 * 1024
 #define SERVER_IP "192.168.1.104"
 #define SERVER_PORT 5566
 
@@ -62,17 +58,6 @@ struct StreamInfo
 	std::string app;
 	int timebase;
 	FrameData frameData;
-};
-
-struct StatisticInfo
-{
-	int64_t totalRecvPackets;
-	int64_t totalRecvFrames;
-	int64_t totalRecvBytes;
-	int64_t totalWriteFrames;
-	int64_t totalWriteBytes;
-	int64_t recvBitrate;
-	std::mutex mux;
 };
 
 struct STREAMING_CLIENT
@@ -119,6 +104,14 @@ stopStreaming( STREAMING_CLIENT * client )
 	}
 }
 
+inline fd_set get_fd_set( STREAMING_CLIENT* client )
+{
+	fd_set fdSet;
+	FD_ZERO( &fdSet );
+	FD_SET( client->conn.m_socketID, &fdSet );
+	return fdSet;
+}
+
 
 std::mutex mux;
 std::condition_variable cond;
@@ -129,11 +122,11 @@ int thread_func_for_receiver( void *arg )
 	StreamInfo& stream = client->stream;
 	size_t timebase = stream.timebase;
 
-	while (true )
+	while ( true )
 	{
-		if ( send_play_packet( client->conn, 
-							   get_current_milli(), 
-							   client->stream.app.c_str() ) <= 0 )
+		if ( send_play_packet( client->conn,
+							   get_current_milli( ),
+							   client->stream.app.c_str( ) ) <= 0 )
 		{
 			Sleep( 100 );
 			continue;
@@ -166,117 +159,108 @@ int thread_func_for_receiver( void *arg )
 	std::priority_queue<PACKET, std::vector<PACKET>, decltype( cmp )> priq( cmp );
 	Frame frame;
 	ZeroMemory( &frame, sizeof Frame );
-	int totalSize = 0;
-	size_t bodySize = 0;
+	int32_t totalSize = 0;
+	int32_t bodySize = 0;
 	while ( client->state == STREAMING_START )
 	{
 		// receive packet
 		PACKET pkt;
-		int MP = 0;
-		int recvBytes = 0;
-		do
+		timeval tm { 0,100 };
+		fd_set fdSet = get_fd_set( client );
+		while ( select( 0, &fdSet, nullptr, nullptr, &tm ) <= 0 &&
+				client->state == STREAMING_START )
 		{
-			if ( (recvBytes = recv_packet( client->conn, pkt, NonBlocking )) <= 0 ) // no packet, continue loop next
-				break;
+			fdSet = get_fd_set( client );
+			Sleep( 10 );
+		}
+
+		if ( recv_packet( client->conn, pkt, NonBlocking ) <= 0 ) // no packet, continue loop next
+			break;//break;
 #ifdef _DEBUG
-			if (recvBytes > MAX_PACKET_SIZE )
-				break;
-			int64_t currentTime = time(0);
-			client->stat.totalRecvBytes += BODY_SIZE_H(pkt.header);
-			client->stat.totalRecvPackets++;
-			if ( currentTime != timeBeg )
-				client->stat.recvBitrate = client->stat.totalRecvBytes / ( currentTime - timeBeg );
-			if ( lastTimestamp == 0 )
-				lastTimestamp = pkt.header.timestamp;
-			else
-			{
-				if ( lastTimestamp != pkt.header.timestamp )
-				{
-					client->stat.totalRecvFrames++;
-					lastTimestamp = pkt.header.timestamp;
-				}
-			}
+		if ( INVALID_PACK( pkt.header ) )
+			break;
+
+		std::unique_lock<std::mutex> lock( client->mux );
+		caculate_statistc( client->stat, pkt, StatRecv );
+		lock.unlock( );
 #endif // _DEBUG
 
-			if ( maxRecvBuf < pkt.header.size )
+		if ( maxRecvBuf < pkt.header.size )
+		{
+			maxRecvBuf = ( pkt.header.size + MAX_PACKET_SIZE - 1 ) / MAX_PACKET_SIZE * MAX_PACKET_SIZE;
+			client->conn.set_socket_rcvbuf_size( maxRecvBuf );
+		}
+
+		//MP = pkt.header.MP;
+		switch ( pkt.header.type )
+		{
+		case Pull:
+		{
+			if ( stream.app != pkt.header.app )
 			{
-				maxRecvBuf = ( pkt.header.size + MAX_PACKET_SIZE - 1 ) / MAX_PACKET_SIZE * MAX_PACKET_SIZE;
-				client->conn.set_socket_rcvbuf_size( maxRecvBuf );
+				send_err_packet( client->conn,
+								 get_current_milli( ),
+								 pkt.header.app );
 			}
 
-			MP = pkt.header.MP;
-			switch ( pkt.header.type )
+			if ( priq.empty( ) )
 			{
-			case Pull:
+				frame.timestamp = pkt.header.timestamp;
+				frame.size = pkt.header.size;
+				frame.data = ( char * ) malloc( frame.size );
+			}
+
+			if ( frame.timestamp == pkt.header.timestamp )
 			{
-				if ( stream.app != pkt.header.app )
-				{
-					send_err_packet( client->conn,
-									 get_current_milli( ),
-									 pkt.header.app );
-				}
-
-				if ( priq.empty( ) )
-				{
-					frame.timestamp = pkt.header.timestamp;
-					frame.size = pkt.header.size;
-					frame.data = ( char * ) malloc( frame.size );
-				}
-
-				if (frame.timestamp == pkt.header.timestamp )
-				{
-					priq.push( pkt );
-					totalSize += BODY_SIZE_H( pkt.header );
-				}
-				else
-					break;
-
-				// full frame
-				if ( totalSize == frame.size )
-				{
-					PACKET tmpPack;
-					int idx = 0;
-					while ( !priq.empty( ) )
-					{
-						tmpPack = priq.top( );
-						priq.pop( );
-						bodySize = BODY_SIZE_H( tmpPack.header );
-						memcpy( &frame.data[ idx ], tmpPack.body, bodySize );
-						idx += bodySize;
-					}
-					std::unique_lock<std::mutex> lock( client->mux );
-					stream.frameData.push( frame );
-					lock.unlock( );
-					totalSize = 0;
-				}
-				break;
+				priq.push( pkt );
+				totalSize += BODY_SIZE_H( pkt.header );
 			}
-			case Fin:
+			else; // if enter here, wrong
+
+
+			// full frame
+			if ( totalSize == frame.size )
 			{
-				if ( stream.app != pkt.header.app )
+				PACKET tmpPack;
+				int idx = 0;
+				while ( !priq.empty( ) )
 				{
-					send_err_packet( client->conn,
-									 get_current_milli( ),
-									 pkt.header.app );
+					tmpPack = priq.top( );
+					priq.pop( );
+					bodySize = BODY_SIZE_H( tmpPack.header );
+					memcpy( &frame.data[ idx ], tmpPack.body, bodySize );
+					idx += bodySize;
 				}
-				stopStreaming( client );
-				break;
+				std::unique_lock<std::mutex> lock( client->mux );
+				stream.frameData.push( frame );
+				lock.unlock( );
+				totalSize = 0;
 			}
-// 			case Ack:
-// 			{
-// 				break;
-// 			}
-// 			case Err:
-// 			{
-// 				break;
-// 			}
-			default:
-				RTMP_Log( RTMP_LOGDEBUG, "unknown packet." );
-				break;
+			break;
+		}
+		case Fin:
+		{
+			if ( stream.app != pkt.header.app )
+			{
+				send_err_packet( client->conn,
+								 get_current_milli( ),
+								 pkt.header.app );
 			}
-		} while (MP);
-
-		Sleep( 10 );
+			stopStreaming( client );
+			break;
+		}
+		// 			case Ack:
+		// 			{
+		// 				break;
+		// 			}
+		// 			case Err:
+		// 			{
+		// 				break;
+		// 			}
+		default:
+			RTMP_Log( RTMP_LOGDEBUG, "unknown packet." );
+			break;
+		}
 	}
 	RTMP_Log( RTMP_LOGDEBUG, "receiver thread is quit." );
 	return true;
@@ -286,8 +270,8 @@ int thread_func_for_writer( void *arg )
 {
 	RTMP_LogPrintf( "writer thread is start...\n" );
 	STREAMING_CLIENT *client = ( STREAMING_CLIENT * ) arg;
-	
-	FILE *fp = fopen( client->filePath.c_str(), "wb" );
+
+	FILE *fp = fopen( client->filePath.c_str( ), "wb" );
 	if ( !fp )
 	{
 		RTMP_LogPrintf( "Open File Error.\n" );
@@ -325,8 +309,6 @@ int thread_func_for_writer( void *arg )
 				  frame.timestamp,
 				  writeTimestamp,
 				  writeTimestamp - frame.timestamp );
-		client->stat.totalWriteBytes += frame.size;
-		client->stat.totalWriteFrames++;
 #endif // _DEBUG
 		free( frame.data );
 	}
@@ -336,16 +318,30 @@ int thread_func_for_writer( void *arg )
 	return true;
 }
 
-void show_statistics(STREAMING_CLIENT* client )
+void show_statistics( STREAMING_CLIENT* client )
 {
-	RTMP_LogAndPrintf( RTMP_LOGDEBUG, "recv %lldB, %lld packets, %lld frames, %.2fKB/s\nwrite %lldB, %lld frames",
-					   client->stat.totalRecvBytes,
-					   client->stat.totalRecvPackets,
-					   client->stat.totalRecvFrames,
-					   KB(client->stat.recvBitrate),
-					   client->stat.totalWriteBytes,
-					   client->stat.totalWriteFrames
-					   );
+	printf( "%-15s%-6s%-8s%-10s %-8s\t\t%-13s\t%-10s\t%-15s\t %-8s\t%-13s\t%-10s\t%-15s\n",
+			"ip", "port", "type", "app",
+			"rec-byte", "rec-byte-rate", "rec-packet", "rec-packet-rate",
+			"snd-byte", "snd-byte-rate", "snd-packet", "snd-packet-rate" );
+
+
+	printf( "%-15s%-6d%-8s%-10s %-6.2fMB\t\t%-9.2fKB/s\t%-10lld\t%-13lld/s\t %-6.2fMB\t%-9.2fKB/s\t%-10lld\t%-13lld/s\n",
+			client->conn.getIP( ).c_str( ),
+			client->conn.getPort( ),
+			"Puller",
+			client->stream.app.c_str(),
+
+			MB( client->stat.recvBytes ),
+			KB( client->stat.recvByteRate ),
+			client->stat.recvPackets,
+			client->stat.recvPacketRate,
+
+			MB( client->stat.sendBytes ),
+			KB( client->stat.sendByteRate ),
+			client->stat.sendPackets,
+			client->stat.sendPacketRate );
+
 }
 
 int thread_func_for_controller( void *arg )
@@ -355,40 +351,49 @@ int thread_func_for_controller( void *arg )
 	std::string choice;
 	while ( client->state == STREAMING_START )
 	{
-		std::cin >> choice;
-		if ( choice == "quit" || choice == "q" || choice == "exit" )
-		{
-			RTMP_LogAndPrintf( RTMP_LOGDEBUG, "Exiting" );
-			stopStreaming( client );
-		}
-		else if ( choice == "status" || choice == "s" )
-		{
-			show_statistics( client );
-		}
+		system( "cls" );
+		show_statistics( client );
+		Sleep( 1000 );
+// 		std::cin >> choice;
+// 		if ( choice == "quit" || choice == "q" || choice == "exit" )
+// 		{
+// 			RTMP_LogAndPrintf( RTMP_LOGDEBUG, "Exiting" );
+// 			stopStreaming( client );
+// 		}
+// 		else if ( choice == "status" || choice == "s" )
+// 		{
+// 			show_statistics( client );
+// 		}
 	}
 	RTMP_LogPrintf( "controller thread is quit.\n" );
 	return 0;
 }
 
-int thread_func_for_aliver( void *arg )
-{
-	RTMP_Log( RTMP_LOGDEBUG, "cleaner thread is start..." );
-	STREAMING_CLIENT* client = ( STREAMING_CLIENT* ) arg;
-	StreamInfo& streamInfo = client->stream;
-	while ( client->state == STREAMING_START )
-	{
-		// send heart packet
-		send_alive_packet( client->conn, 
-						   get_current_milli( ), 
-						   streamInfo.app.c_str( ) );
-		Sleep( 1000 );
-	}
-	RTMP_Log( RTMP_LOGDEBUG, "cleaner thread is quit." );
-	return true;
-}
+// int thread_func_for_aliver( void *arg )
+// {
+// 	RTMP_Log( RTMP_LOGDEBUG, "cleaner thread is start..." );
+// 	STREAMING_CLIENT* client = ( STREAMING_CLIENT* ) arg;
+// 	StreamInfo& streamInfo = client->stream;
+// 	while ( client->state == STREAMING_START )
+// 	{
+// 		// send heart packet
+// 		send_alive_packet( client->conn,
+// 						   get_current_milli( ),
+// 						   streamInfo.app.c_str( ) );
+// 		Sleep( 1000 );
+// 	}
+// 	RTMP_Log( RTMP_LOGDEBUG, "cleaner thread is quit." );
+// 	return true;
+// }
 
-int main( )
+int main( int argc, char* argv[ ] )
 {
+	if ( argc < 3 )
+	{
+		printf( "please pass in live name and file path parameter.\n" );
+		printf( "usage: client \"live-name\" \"/path/to/save/file\" \n" );
+		return 0;
+	}
 #ifdef _DEBUG
 	FILE* dumpfile = fopen( "hevc_client.dump", "a+" );
 	RTMP_LogSetOutput( dumpfile );
@@ -411,8 +416,8 @@ int main( )
 
 	STREAMING_CLIENT *client = new STREAMING_CLIENT;
 	client->state = STREAMING_START;
-	client->stream.app = "live";
-	client->filePath = "receive.h264";
+	client->stream.app = argv[ 1 ];
+	client->filePath = argv[ 2 ];
 	ZeroMemory( &client->stat, sizeof StatisticInfo );
 	while ( 0 != client->conn.connect_to( SERVER_IP, SERVER_PORT ) )
 	{
@@ -425,12 +430,12 @@ int main( )
 #endif // _DEBUG
 	std::thread reciver( thread_func_for_receiver, client );
 	std::thread writer( thread_func_for_writer, client );
-	std::thread aliver( thread_func_for_aliver, client );
+	//std::thread aliver( thread_func_for_aliver, client );
 	std::thread controller( thread_func_for_controller, client );
 
 	reciver.join( );
 	writer.join( );
-	aliver.join( );
+	//aliver.join( );
 	controller.join( );
 #ifdef _DEBUG
 	RTMP_LogThreadStop( );
