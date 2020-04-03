@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio 15
 VisualStudioVersion = 15.0.28307.1062
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "hevc_client", "hevc_client\hevc_client.vcxproj", "{44AF3396-041A-43C4-9EDF-88B510B5693B}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "hevc_puller", "hevc_puller\hevc_puller.vcxproj", "{44AF3396-041A-43C4-9EDF-88B510B5693B}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
