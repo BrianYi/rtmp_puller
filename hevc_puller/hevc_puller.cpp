@@ -1,5 +1,7 @@
-// hevc_rtmp_test.cpp : This file contains the 'main' function. Program execution begins and ends there.
-//
+/*
+ * Copyright (C) 2020 BrianYi, All rights reserved
+ */
+
 #include <winsock2.h>
 #include <iostream>
 #include <vector>
@@ -286,14 +288,6 @@ int thread_func_for_receiver( void *arg )
 			stopStreaming( puller );
 			break;
 		}
-		// 			case Ack:
-		// 			{
-		// 				break;
-		// 			}
-		// 			case Err:
-		// 			{
-		// 				break;
-		// 			}
 		default:
 			RTMP_Log( RTMP_LOGDEBUG, "unknown packet." );
 			break;
